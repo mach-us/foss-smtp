@@ -3,7 +3,7 @@
  * Plugin Name: FOSS SMTP
  * Plugin URI: https://github.com/mach-us/foss-smtp
  * Description: A simple SMTP plugin for WordPress with testing capabilities and detailed logging
- * Version: 1.0.0
+ * Version: 1.0.1
  * Author: Machus
  * License: GPL v2 or later
  * License URI: http://www.gnu.org/licenses/gpl-2.0.txt
@@ -16,7 +16,7 @@ if (!defined('ABSPATH')) {
 }
 
 // Define plugin constants
-define('FOSS_SMTP_VERSION', '1.0.0');
+define('FOSS_SMTP_VERSION', '1.0.1');
 define('FOSS_SMTP_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('FOSS_SMTP_PLUGIN_URL', plugin_dir_url(__FILE__));
 
@@ -48,11 +48,18 @@ class Foss_SMTP {
             $this->default_options
         );
         
+        // Create/update database table on plugin initialization
+        $this->setup_email_log_table();
+        
         add_action('admin_menu', [$this, 'add_admin_menu']);
         add_action('admin_init', [$this, 'register_settings']);
+        add_action('wp_mail_failed', [$this, 'log_email_error']);
         add_action('phpmailer_init', [$this, 'configure_smtp']);
+        add_action('wp_mail', [$this, 'log_email_before_send']);
+        add_filter('wp_mail_succeeded', [$this, 'log_email_success']);
         add_action('admin_enqueue_scripts', [$this, 'enqueue_admin_scripts']);
         add_action('wp_ajax_foss_smtp_test', [$this, 'ajax_test_email']);
+        add_action('wp_ajax_foss_smtp_view_email', [$this, 'ajax_view_email']);
         add_action('admin_notices', [$this, 'admin_notices']);
         
         // Add settings link on plugin page
@@ -60,14 +67,17 @@ class Foss_SMTP {
     }
 
     public function enqueue_admin_scripts($hook) {
-        if ('settings_page_foss-smtp' !== $hook) {
+        if (!in_array($hook, ['settings_page_foss-smtp', 'settings_page_foss-smtp-log'])) {
             return;
         }
 
+        wp_enqueue_style('wp-jquery-ui-dialog');
+        wp_enqueue_script('jquery-ui-dialog');
+        
         wp_enqueue_script(
             'foss-smtp-admin',
             FOSS_SMTP_PLUGIN_URL . 'js/admin.js',
-            ['jquery'],
+            ['jquery', 'jquery-ui-dialog'],
             FOSS_SMTP_VERSION,
             true
         );
@@ -75,9 +85,12 @@ class Foss_SMTP {
         wp_localize_script('foss-smtp-admin', 'fossSmtpAdmin', [
             'ajaxUrl' => admin_url('admin-ajax.php'),
             'nonce' => wp_create_nonce('foss_smtp_test'),
+            'emailLogNonce' => wp_create_nonce('foss_smtp_view_email'),
             'sending' => __('Sending test email...', 'foss-smtp'),
             'success' => __('Test email sent successfully!', 'foss-smtp'),
-            'error' => __('Failed to send test email. Check logs for details.', 'foss-smtp')
+            'error' => __('Failed to send test email. Check logs for details.', 'foss-smtp'),
+            'viewEmail' => __('View Email', 'foss-smtp'),
+            'close' => __('Close', 'foss-smtp')
         ]);
     }
 
@@ -112,6 +125,15 @@ class Foss_SMTP {
             'manage_options',
             'foss-smtp',
             [$this, 'render_settings_page']
+        );
+        
+        add_submenu_page(
+            'options-general.php',
+            __('Email Log', 'foss-smtp'),
+            __('Email Log', 'foss-smtp'),
+            'manage_options',
+            'foss-smtp-log',
+            [$this, 'render_log_page']
         );
     }
 
@@ -347,6 +369,232 @@ class Foss_SMTP {
                 'logs' => $this->log_messages
             ]);
         }
+    }
+
+    private function setup_email_log_table() {
+        global $wpdb;
+        $table_name = $wpdb->prefix . 'foss_smtp_email_log';
+        
+        $charset_collate = $wpdb->get_charset_collate();
+        
+        $sql = "CREATE TABLE IF NOT EXISTS $table_name (
+            id bigint(20) NOT NULL AUTO_INCREMENT,
+            date_sent datetime NOT NULL,
+            to_email text NOT NULL,
+            subject text NOT NULL,
+            message text NOT NULL,
+            headers text,
+            attachments text,
+            status varchar(20) NOT NULL,
+            error_message text,
+            PRIMARY KEY (id)
+        ) $charset_collate;";
+        
+        require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
+        dbDelta($sql);
+    }
+
+    public function log_email_before_send($mail_data) {
+        $this->current_email = $mail_data;
+        return $mail_data;
+    }
+
+    public function log_email_success($mail_data) {
+        $this->log_email('success');
+        return $mail_data;
+    }
+
+    public function log_email_error($error) {
+        $this->log_email('failed', $error->get_error_message());
+    }
+
+    private function log_email($status, $error_message = '') {
+        global $wpdb;
+        $table_name = $wpdb->prefix . 'foss_smtp_email_log';
+        
+        $mail_data = $this->current_email;
+        if (empty($mail_data)) {
+            return;
+        }
+
+        $to = is_array($mail_data['to']) ? implode(', ', $mail_data['to']) : $mail_data['to'];
+        
+        $wpdb->insert(
+            $table_name,
+            [
+                'date_sent' => current_time('mysql'),
+                'to_email' => $to,
+                'subject' => $mail_data['subject'],
+                'message' => $mail_data['message'],
+                'headers' => is_array($mail_data['headers']) ? implode("\n", $mail_data['headers']) : $mail_data['headers'],
+                'attachments' => is_array($mail_data['attachments']) ? serialize($mail_data['attachments']) : '',
+                'status' => $status,
+                'error_message' => $error_message
+            ],
+            [
+                '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s'
+            ]
+        );
+    }
+
+    public function ajax_view_email() {
+        check_ajax_referer('foss_smtp_view_email', 'nonce');
+        
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(['message' => __('Permission denied.', 'foss-smtp')]);
+        }
+        
+        $email_id = isset($_POST['id']) ? intval($_POST['id']) : 0;
+        if (!$email_id) {
+            wp_send_json_error(['message' => __('Invalid email ID.', 'foss-smtp')]);
+        }
+        
+        global $wpdb;
+        $table_name = $wpdb->prefix . 'foss_smtp_email_log';
+        
+        $email = $wpdb->get_row(
+            $wpdb->prepare("SELECT * FROM $table_name WHERE id = %d", $email_id)
+        );
+        
+        if (!$email) {
+            wp_send_json_error(['message' => __('Email not found.', 'foss-smtp')]);
+        }
+        
+        wp_send_json_success([
+            'date' => $email->date_sent,
+            'to' => $email->to_email,
+            'subject' => $email->subject,
+            'message' => $email->message,
+            'headers' => $email->headers,
+            'status' => $email->status,
+            'error' => $email->error_message
+        ]);
+    }
+
+    public function render_log_page() {
+        global $wpdb;
+        $table_name = $wpdb->prefix . 'foss_smtp_email_log';
+        
+        // Handle log clearing
+        if (isset($_POST['clear_logs']) && check_admin_referer('clear_email_logs')) {
+            $wpdb->query("TRUNCATE TABLE $table_name");
+            echo '<div class="notice notice-success"><p>' . __('Email logs cleared successfully.', 'foss-smtp') . '</p></div>';
+        }
+
+        // Get logs with pagination
+        $page = isset($_GET['log_page']) ? max(1, intval($_GET['log_page'])) : 1;
+        $per_page = 20;
+        $offset = ($page - 1) * $per_page;
+        
+        $logs = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT * FROM $table_name ORDER BY date_sent DESC LIMIT %d OFFSET %d",
+                $per_page,
+                $offset
+            )
+        );
+        
+        $total_logs = $wpdb->get_var("SELECT COUNT(*) FROM $table_name");
+        $total_pages = ceil($total_logs / $per_page);
+        
+        ?>
+        <div class="wrap">
+            <h1><?php _e('Email Log', 'foss-smtp'); ?></h1>
+            
+            <form method="post">
+                <?php wp_nonce_field('clear_email_logs'); ?>
+                <button type="submit" name="clear_logs" class="button button-secondary" onclick="return confirm('<?php esc_attr_e('Are you sure you want to clear all email logs?', 'foss-smtp'); ?>')">
+                    <?php _e('Clear Logs', 'foss-smtp'); ?>
+                </button>
+            </form>
+            
+            <table class="wp-list-table widefat fixed striped">
+                <thead>
+                    <tr>
+                        <th><?php _e('Date', 'foss-smtp'); ?></th>
+                        <th><?php _e('To', 'foss-smtp'); ?></th>
+                        <th><?php _e('Subject', 'foss-smtp'); ?></th>
+                        <th><?php _e('Status', 'foss-smtp'); ?></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php if (empty($logs)): ?>
+                        <tr>
+                            <td colspan="4"><?php _e('No emails logged yet.', 'foss-smtp'); ?></td>
+                        </tr>
+                    <?php else: ?>
+                        <?php foreach ($logs as $log): ?>
+                            <tr>
+                                <td><?php echo esc_html($log->date_sent); ?></td>
+                                <td><?php echo esc_html($log->to_email); ?></td>
+                                <td>
+                                    <a href="#" class="view-email-content" data-email-id="<?php echo esc_attr($log->id); ?>">
+                                        <?php echo esc_html($log->subject); ?>
+                                    </a>
+                                </td>
+                                <td>
+                                    <?php if ($log->status === 'success'): ?>
+                                        <span class="dashicons dashicons-yes" style="color: green;"></span>
+                                    <?php else: ?>
+                                        <span class="dashicons dashicons-no" style="color: red;" title="<?php echo esc_attr($log->error_message); ?>"></span>
+                                    <?php endif; ?>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                </tbody>
+            </table>
+            
+            <?php if ($total_pages > 1): ?>
+                <div class="tablenav bottom">
+                    <div class="tablenav-pages">
+                        <?php
+                        echo paginate_links([
+                            'base' => add_query_arg('log_page', '%#%'),
+                            'format' => '',
+                            'prev_text' => __('&laquo;'),
+                            'next_text' => __('&raquo;'),
+                            'total' => $total_pages,
+                            'current' => $page
+                        ]);
+                        ?>
+                    </div>
+                </div>
+            <?php endif; ?>
+
+            <!-- Email Content Modal -->
+            <div id="email-content-modal" style="display: none;" title="<?php esc_attr_e('Email Details', 'foss-smtp'); ?>">
+                <table class="widefat" style="border: none;">
+                    <tr>
+                        <th style="width: 100px;"><?php _e('Date:', 'foss-smtp'); ?></th>
+                        <td id="modal-date"></td>
+                    </tr>
+                    <tr>
+                        <th><?php _e('To:', 'foss-smtp'); ?></th>
+                        <td id="modal-to"></td>
+                    </tr>
+                    <tr>
+                        <th><?php _e('Subject:', 'foss-smtp'); ?></th>
+                        <td id="modal-subject"></td>
+                    </tr>
+                    <tr>
+                        <th><?php _e('Headers:', 'foss-smtp'); ?></th>
+                        <td id="modal-headers"></td>
+                    </tr>
+                    <tr>
+                        <th><?php _e('Status:', 'foss-smtp'); ?></th>
+                        <td id="modal-status"></td>
+                    </tr>
+                    <tr>
+                        <th><?php _e('Message:', 'foss-smtp'); ?></th>
+                        <td>
+                            <div id="modal-message" style="max-height: 300px; overflow-y: auto; white-space: pre-wrap;"></div>
+                        </td>
+                    </tr>
+                </table>
+            </div>
+        </div>
+        <?php
     }
 }
 
